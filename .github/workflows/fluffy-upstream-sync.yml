@@ -1,0 +1,158 @@
+name: Upstream sync
+
+on:
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: https://github.com/jellyfin/jellyfin-web.git
+  # Must match the server's major version. See docs/fluffy-moose/upstream-sync.md.
+  UPSTREAM_BRANCH: release-12.z
+  TARGET_BRANCH: fluffy-moose
+  SYNC_BRANCH: sync/upstream
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge and test Jellyfin's updates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out ${{ env.TARGET_BRANCH }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          # The built-in token cannot push commits that change workflow files.
+          # A SYNC_TOKEN secret (PAT with the workflow scope) lifts that limit.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Fetch Jellyfin's ${{ env.UPSTREAM_BRANCH }}
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          count=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "Already up to date with Jellyfin's \`$UPSTREAM_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Jellyfin has $count new commit(s) on \`$UPSTREAM_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Merge
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$SYNC_BRANCH"
+          # shellcheck disable=SC2016 # backticks below are literal Markdown
+          if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            {
+              echo "### Merge conflict"
+              echo
+              echo "Jellyfin's changes clash with ours in:"
+              echo
+              git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/'
+              echo
+              echo 'Merge by hand: see `docs/fluffy-moose/upstream-sync.md`.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Set up Node
+        if: steps.fetch.outputs.count != '0'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.fetch.outputs.count != '0'
+        run: npm ci --no-audit
+
+      - name: TypeScript
+        if: steps.fetch.outputs.count != '0'
+        run: npm run build:check
+
+      - name: ESLint
+        if: steps.fetch.outputs.count != '0'
+        run: npm run lint
+
+      - name: Stylelint
+        if: steps.fetch.outputs.count != '0'
+        run: npm run stylelint
+
+      - name: Tests
+        if: steps.fetch.outputs.count != '0'
+        run: npm test
+
+      - name: Production build
+        if: steps.fetch.outputs.count != '0'
+        run: npm run build:production && test -s dist/index.html
+
+      - name: Push ${{ env.SYNC_BRANCH }} and open a pull request
+        if: steps.fetch.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          BASE_SHA: ${{ steps.fetch.outputs.base }}
+          COUNT: ${{ steps.fetch.outputs.count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # shellcheck disable=SC2016 # backticks below are literal Markdown
+          if ! git push --force origin "$SYNC_BRANCH" 2> push.err; then
+            cat push.err
+            if grep -qi 'workflow' push.err; then
+              {
+                echo "### Push refused"
+                echo
+                echo "Jellyfin changed its own workflow files, and the built-in token is not allowed to push those."
+                echo 'Merge by hand (see `docs/fluffy-moose/upstream-sync.md`), or add a `SYNC_TOKEN` secret.'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi
+
+          {
+            echo "Jellyfin has $COUNT new commit(s) on \`$UPSTREAM_BRANCH\`. They merged cleanly into \`$TARGET_BRANCH\`, and TypeScript, ESLint, Stylelint, the tests and a production build all passed: [checks run]($RUN_URL)."
+            echo
+            echo "Merge this when you're ready, then deploy the new build. See \`docs/fluffy-moose/deploying.md\`."
+            echo
+            echo "<details><summary>Jellyfin's changes</summary>"
+            echo
+            git log --no-merges --format='- %s (%h)' "$BASE_SHA..upstream/$UPSTREAM_BRANCH" | head -100
+            echo
+            echo "</details>"
+          } > pr-body.md
+
+          if gh pr view "$SYNC_BRANCH" --json state --jq .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit "$SYNC_BRANCH" --body-file pr-body.md
+          else
+            gh pr create --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" \
+              --title "Jellyfin updates from $UPSTREAM_BRANCH" --body-file pr-body.md
+          fi
+
+  newer-release:
+    name: Check for a newer Jellyfin release branch
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Compare release branches
+        run: |
+          current=${UPSTREAM_BRANCH#release-}
+          current=${current%%.*}
+          latest=$(git ls-remote --heads "$UPSTREAM_REPO" 'release-*' \
+            | sed -n 's#.*refs/heads/release-\([0-9][0-9]*\)\.z$#\1#p' | sort -n | tail -1)
+          echo "Tracking release-$current.z; newest upstream is release-${latest:-?}.z" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$latest" ] && [ "$latest" -gt "$current" ]; then
+            echo "::error::Jellyfin has started release-$latest.z. Plan the server and web upgrade together, see docs/fluffy-moose/upstream-sync.md."
+            exit 1
+          fi

@@ -1,0 +1,59 @@
+name: Fluffy Moose checks
+
+on:
+  pull_request:
+    branches:
+      - fluffy-moose
+  push:
+    branches:
+      - fluffy-moose
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Build, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: TypeScript
+        run: npm run build:check
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Stylelint
+        run: npm run stylelint
+
+      - name: Tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build:production
+
+      - name: Check the build is not empty
+        run: test -s dist/index.html
+
+      - name: Upload the site
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fluffy-moose-web
+          path: dist
+          retention-days: 14
